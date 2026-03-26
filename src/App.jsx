@@ -37,7 +37,8 @@ const db = getDatabase(app);
   Load the API key from Vite env. Create a `.env` or `.env.local`
   with `VITE_GOOGLE_MAPS_API_KEY=your_key_here` (do NOT commit keys).
 ========================= */
-const GOOGLE_MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || "";
+const GOOGLE_MAPS_API_KEY =
+  import.meta.env.VITE_GOOGLE_MAPS_API_KEY || "AIzaSyAADbfCsSV024p4bhaeeOtqp1mf1WcKp4o";
 
 /* =========================
    3) DEFAULT GEOFENCES
@@ -112,18 +113,19 @@ function loadGoogleMaps(apiKey) {
         resolve(window.google);
         return;
       }
-      existing.addEventListener("load", () => resolve(window.google));
-      existing.addEventListener("error", reject);
+      const onLoad = () => resolve(window.google);
+      const onError = (e) => reject(e);
+      existing.addEventListener("load", onLoad, { once: true });
+      existing.addEventListener("error", onError, { once: true });
       return;
     }
 
-    window.__onGoogleMapsReady = () => resolve(window.google);
-
     const script = document.createElement("script");
     script.id = "google-maps-script";
-    script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&v=weekly&libraries=geometry&callback=__onGoogleMapsReady`;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&v=weekly&libraries=geometry&loading=async`;
     script.async = true;
     script.defer = true;
+    script.onload = () => resolve(window.google);
     script.onerror = reject;
     document.body.appendChild(script);
   });
@@ -373,9 +375,6 @@ function App() {
       active = false;
       if (popupTimerRef.current) clearTimeout(popupTimerRef.current);
       window.gm_authFailure = previousAuthFailure;
-      if (window.__onGoogleMapsReady) {
-        delete window.__onGoogleMapsReady;
-      }
     };
   }, []);
 
