@@ -360,8 +360,12 @@ function App() {
         });
 
         drawGeofences(DEFAULT_GEOFENCES);
-        setMapLoaded(true);
-        setSystemStatus("Map loaded successfully");
+
+        // Wait for map to fully render before signalling ready
+        window.google.maps.event.addListenerOnce(mapInstance.current, "idle", () => {
+          setMapLoaded(true);
+          setSystemStatus("Map loaded successfully");
+        });
       })
       .catch((err) => {
         console.error("Google Maps load error:", err);
@@ -659,7 +663,10 @@ function App() {
       if (mapInstance.current && markerRef.current) {
         const pos = { lat: animal.lat, lng: animal.lng };
         updateMarkerPosition(pos, `${animal.animalId} - ${animal.status}`);
-        mapInstance.current.panTo(pos);
+        mapInstance.current.setCenter(pos);
+        if (mapInstance.current.getZoom() < 13) {
+          mapInstance.current.setZoom(15);
+        }
 
         infoWindowRef.current.setContent(`
           <div style="min-width:240px;padding:8px;">
@@ -824,6 +831,16 @@ function App() {
     if (viewportWidth <= 1024) return 430;
     return 520;
   }, [viewportWidth]);
+
+  // Re-trigger Google Maps resize whenever the map height changes
+  useEffect(() => {
+    if (!mapLoaded || !mapInstance.current) return;
+    window.google.maps.event.trigger(mapInstance.current, "resize");
+    const center = currentAnimal
+      ? { lat: currentAnimal.lat, lng: currentAnimal.lng }
+      : { lat: 12.9716, lng: 77.5946 };
+    mapInstance.current.setCenter(center);
+  }, [mapHeight]);
 
   return (
     <div style={styles.app} className="appRoot">
@@ -1132,10 +1149,10 @@ const styles = {
   },
   map: {
     width: "100%",
-    height: "520px",
-    borderRadius: "14px",
-    overflow: "hidden",
+    display: "block",
+    position: "relative",
     border: "1px solid #e2e8f0",
+    borderRadius: "14px",
   },
   mapError: {
     marginTop: "10px",
