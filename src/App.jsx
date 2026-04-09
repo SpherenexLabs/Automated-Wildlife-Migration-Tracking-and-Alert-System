@@ -46,51 +46,46 @@ const GOOGLE_MAPS_API_KEY =
 ========================= */
 const DEFAULT_GEOFENCES = [
   {
-    // ~235 m south-west of GPS → animal is INSIDE on load → immediate ENTER alert
     id: "zone_1",
     name: "Village Boundary",
     type: "village",
-    center: { lat: 12.9780, lng: 77.5930 },
+    center: { lat: 12.8840, lng: 77.5710 },
     radius: 500,
     dwellLimitMinutes: 5,
     color: "#e53935",
   },
   {
-    // ~540 m north-east of GPS → animal is OUTSIDE → alert fires when animal moves NE
     id: "zone_2",
     name: "Farmland Area",
     type: "farmland",
-    center: { lat: 12.9825, lng: 77.5985 },
+    center: { lat: 12.8930, lng: 77.5740 },
     radius: 400,
     dwellLimitMinutes: 8,
     color: "#fb8c00",
   },
   {
-    // ~405 m north-west of GPS → animal is OUTSIDE
     id: "zone_3",
     name: "Highway Safety Belt",
     type: "highway",
-    center: { lat: 12.9820, lng: 77.5920 },
+    center: { lat: 12.8900, lng: 77.5670 },
     radius: 300,
     dwellLimitMinutes: 3,
     color: "#8e24aa",
   },
   {
-    // ~647 m south-east of GPS → animal is OUTSIDE
     id: "zone_4",
     name: "Railway Track Alert Zone",
     type: "railway",
-    center: { lat: 12.9760, lng: 77.5995 },
+    center: { lat: 12.8850, lng: 77.5760 },
     radius: 350,
     dwellLimitMinutes: 2,
     color: "#3949ab",
   },
   {
-    // ~77 m north of GPS → animal is INSIDE on load → immediate ENTER alert
     id: "zone_5",
     name: "Forest Border",
     type: "forest_border",
-    center: { lat: 12.9800, lng: 77.5950 },
+    center: { lat: 12.8950, lng: 77.5660 },
     radius: 700,
     dwellLimitMinutes: 10,
     color: "#00897b",
@@ -227,6 +222,7 @@ function findLiveCoordinatePayload(raw) {
 
 function App() {
   const mapRef = useRef(null);
+  const mapWrapperRef = useRef(null);
   const mapInstance = useRef(null);
   const markerRef = useRef(null);
   const pathPolylineRef = useRef(null);
@@ -239,10 +235,13 @@ function App() {
   const pathKeysRef = useRef(new Set());
   const zonePresenceRef = useRef({});
   const popupTimerRef = useRef(null);
+  const userMarkerRef = useRef(null);
+  const prevDistanceRef = useRef(null);
 
   const [mapLoaded, setMapLoaded] = useState(false);
   const [mapError, setMapError] = useState(null);
   const [currentAnimal, setCurrentAnimal] = useState(null);
+  const [currentUserLocation, setCurrentUserLocation] = useState(null);
   const [pathPoints, setPathPoints] = useState([]);
   const [history, setHistory] = useState([]);
   const [alerts, setAlerts] = useState([]);
@@ -258,6 +257,19 @@ function App() {
     const onResize = () => setViewportWidth(window.innerWidth);
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  // Get user's live device GPS
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        setCurrentUserLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      },
+      (err) => console.warn("Geolocation:", err.message),
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
   }, []);
 
   const updateMarkerPosition = (pos, title) => {
@@ -334,13 +346,20 @@ function App() {
           throw new Error("Google Maps API loaded, but Map constructor is unavailable.");
         }
 
+        // Temporarily remove overflow:hidden so Google Maps can initialize fully
+        // without its internal tile layers being clipped (causes blank/split map)
+        if (mapWrapperRef.current) {
+          mapWrapperRef.current.style.overflow = "visible";
+        }
+
         mapInstance.current = new MapCtor(mapRef.current, {
           center: { lat: 12.9716, lng: 77.5946 },
-          zoom: 13,
-          mapTypeId: "terrain",
+          zoom: 15,
+          mapTypeId: "roadmap",
           fullscreenControl: true,
           streetViewControl: false,
           mapTypeControl: true,
+          gestureHandling: "greedy",
         });
 
         infoWindowRef.current = new window.google.maps.InfoWindow();
@@ -361,7 +380,7 @@ function App() {
 
         drawGeofences(DEFAULT_GEOFENCES);
 
-        // Wait for map to fully render before signalling ready
+        // Restore overflow:hidden after first idle (all tiles rendered)
         window.google.maps.event.addListenerOnce(mapInstance.current, "idle", () => {
           setMapLoaded(true);
           setSystemStatus("Map loaded successfully");
@@ -653,7 +672,8 @@ function App() {
         lat,
         lng,
         speed: Number(livePayload.speed || 0),
-        status: livePayload.status || "moving",
+        // Derive status from speed if Firebase sends a generic value
+        status: Number(livePayload.speed || 0) === 0 ? "stationary" : "moving",
         timestamp: incomingTs ?? Date.now(),
       };
 
@@ -785,23 +805,104 @@ function App() {
       .slice(0, 5);
   }, [zoneStats]);
 
-  const radarModel = useMemo(() => {
-    const centerLat = geofences.reduce((s, z) => s + z.center.lat, 0) / geofences.length;
-    const centerLng = geofences.reduce((s, z) => s + z.center.lng, 0) / geofences.length;
-    const center = { lat: centerLat, lng: centerLng };
+  // Distance from user to animal in metres
+  const userAnimalDistance = useMemo(() => {
+    if (!currentUserLocation || !currentAnimal) return null;
+    return Math.round(
+      haversineDistance(
+        currentUserLocation.lat, currentUserLocation.lng,
+        currentAnimal.lat, currentAnimal.lng
+      )
+    );
+  }, [currentUserLocation, currentAnimal]);
 
-    const zoneRanges = geofences.map((z) => {
-      const distToCenter = haversineDistance(center.lat, center.lng, z.center.lat, z.center.lng);
-      return distToCenter + (z.radius || 0);
-    });
+  // Show proximity alert when animal is within thresholds
+  useEffect(() => {
+    if (userAnimalDistance === null) return;
+    const prev = prevDistanceRef.current;
+
+    const thresholds = [200, 500, 1000];
+    for (const t of thresholds) {
+      const crossedNow = userAnimalDistance <= t;
+      const wasOutside = prev === null || prev > t;
+      if (crossedNow && wasOutside) {
+        const alertObj = {
+          type: "PROXIMITY",
+          level: t <= 200 ? "HIGH" : t <= 500 ? "HIGH" : "MEDIUM",
+          animalId: currentAnimal?.animalId || "ANIMAL_01",
+          zoneName: "Your Location",
+          zoneType: "proximity",
+          distance: userAnimalDistance,
+          timestamp: Date.now(),
+          message: `Animal is ${userAnimalDistance} m from your current location!`,
+        };
+        showPopup(alertObj);
+        saveAlertToFirebase(alertObj);
+        break;
+      }
+    }
+    prevDistanceRef.current = userAnimalDistance;
+  }, [userAnimalDistance]);
+
+  // Place / update blue "You" marker on the map
+  useEffect(() => {
+    if (!mapLoaded || !currentUserLocation || !window.google) return;
+    const pos = { lat: currentUserLocation.lat, lng: currentUserLocation.lng };
+    if (!userMarkerRef.current) {
+      userMarkerRef.current = new window.google.maps.Marker({
+        map: mapInstance.current,
+        position: pos,
+        title: "Your Location",
+        icon: {
+          path: window.google.maps.SymbolPath.CIRCLE,
+          scale: 10,
+          fillColor: "#3b82f6",
+          fillOpacity: 1,
+          strokeColor: "#fff",
+          strokeWeight: 2.5,
+        },
+        zIndex: 10,
+      });
+    } else {
+      userMarkerRef.current.setPosition(pos);
+    }
+  }, [currentUserLocation, mapLoaded]);
+
+  const radarModel = useMemo(() => {
+    // Center the radar on the USER's current device GPS.
+    // Geofence zones and animal are positioned relative to user.
+    const center = currentUserLocation
+      ? { lat: currentUserLocation.lat, lng: currentUserLocation.lng }
+      : currentAnimal
+      ? { lat: currentAnimal.lat, lng: currentAnimal.lng }
+      : {
+          lat: geofences.reduce((s, z) => s + z.center.lat, 0) / geofences.length,
+          lng: geofences.reduce((s, z) => s + z.center.lng, 0) / geofences.length,
+        };
+
+    // Scale: use the animal distance from user + 20% padding.
+    // Minimum 300m so radar always shows meaningful area.
+    // Geofence zones are positioned relative to this scale — if they're
+    // farther than the scale they'll be clamped to edge in Radar.jsx.
     const animalRange = currentAnimal
       ? haversineDistance(center.lat, center.lng, currentAnimal.lat, currentAnimal.lng)
       : 0;
-    const maxDistanceMeters = Math.max(1000, ...zoneRanges, animalRange + 100);
+
+    // Include nearest geofence in scale so zones appear inside radar, not all at edge.
+    // Use the nearest zone center distance as a candidate for the scale.
+    const nearestZoneDist = geofences.length > 0
+      ? Math.min(...geofences.map((z) =>
+          haversineDistance(center.lat, center.lng, z.center.lat, z.center.lng)
+        ))
+      : 0;
+
+    // Scale = enough to show: animal position + nearest geofence center + 20% margin
+    const maxDistanceMeters = Math.max(300, animalRange * 1.5, nearestZoneDist * 1.3);
 
     const zones = geofences.map((z) => {
       const p = toRadarXY(center, z.center, maxDistanceMeters);
-      return { ...z, ...p };
+      const distFromCenter = haversineDistance(center.lat, center.lng, z.center.lat, z.center.lng);
+      return { ...z, ...p, distFromCenter: Math.round(distFromCenter) };
     });
 
     const blips = currentAnimal
@@ -811,18 +912,24 @@ function App() {
             ...toRadarXY(center, { lat: currentAnimal.lat, lng: currentAnimal.lng }, maxDistanceMeters),
             color: "#10b981",
             icon: "\ud83d\udc2f",
+            distanceMeters: userAnimalDistance,
           },
         ]
       : [];
 
-    return { zones, blips };
-  }, [geofences, currentAnimal]);
+    return { zones, blips, maxDistanceMeters };
+  }, [geofences, currentAnimal, currentUserLocation, userAnimalDistance]);
 
   const radarSize = useMemo(() => {
-    if (viewportWidth <= 420) return 230;
-    if (viewportWidth <= 768) return 270;
-    if (viewportWidth <= 1024) return 340;
-    return 420;
+    // Cap radar size to always fit inside the card.
+    // On desktop a 3-col grid card is roughly (viewport - padding) / 3.
+    // Use a safe fraction so it never overflows.
+    const maxFromViewport = Math.floor((viewportWidth - 120) / 3);
+    const capped = Math.min(maxFromViewport, 400);
+    if (viewportWidth <= 420) return Math.min(capped, 210);
+    if (viewportWidth <= 768) return Math.min(capped, 260);
+    if (viewportWidth <= 1024) return Math.min(capped, 310);
+    return Math.max(260, capped);
   }, [viewportWidth]);
 
   const mapHeight = useMemo(() => {
@@ -832,7 +939,7 @@ function App() {
     return 520;
   }, [viewportWidth]);
 
-  // Re-trigger Google Maps resize whenever the map height changes
+  // Re-trigger Google Maps resize whenever the map height changes or map first loads
   useEffect(() => {
     if (!mapLoaded || !mapInstance.current) return;
     window.google.maps.event.trigger(mapInstance.current, "resize");
@@ -840,7 +947,7 @@ function App() {
       ? { lat: currentAnimal.lat, lng: currentAnimal.lng }
       : { lat: 12.9716, lng: 77.5946 };
     mapInstance.current.setCenter(center);
-  }, [mapHeight]);
+  }, [mapHeight, mapLoaded]);
 
   return (
     <div style={styles.app} className="appRoot">
@@ -933,7 +1040,26 @@ function App() {
             ))
           )}
 
-          <div style={{ marginTop: 16 }}>
+          {/* Distance to animal */}
+          <div style={styles.distanceBox}>
+            <div style={styles.distanceLabel}>📍 Distance from You to Animal</div>
+            <div style={styles.distanceValue}>
+              {userAnimalDistance !== null
+                ? userAnimalDistance >= 1000
+                  ? `${(userAnimalDistance / 1000).toFixed(2)} km`
+                  : `${userAnimalDistance} m`
+                : currentUserLocation
+                ? "Waiting for animal GPS..."
+                : "Enable device location for distance"}
+            </div>
+            {currentUserLocation && (
+              <div style={{ fontSize: "11px", color: "#64748b", marginTop: 4 }}>
+                Your GPS: {currentUserLocation.lat.toFixed(5)}, {currentUserLocation.lng.toFixed(5)}
+              </div>
+            )}
+          </div>
+
+          <div style={{ marginTop: 12 }}>
             <div style={styles.smallTitle}>Path Summary</div>
             <div style={styles.miniStats}>
               <span>Total Path Points: {pathPoints.length}</span>
@@ -943,9 +1069,9 @@ function App() {
           </div>
         </div>
 
-        <div style={styles.card}>
+        <div style={{ ...styles.card, overflow: "hidden" }}>
           <h2 style={styles.cardTitle}>Live Radar</h2>
-          <div style={{ display: "flex", justifyContent: "center", padding: 8 }} className="radarWrap">
+          <div style={{ display: "flex", justifyContent: "center", alignItems: "center", overflow: "hidden", padding: 4 }} className="radarWrap">
             <Radar
               size={radarSize}
               zones={radarModel.zones}
@@ -953,7 +1079,7 @@ function App() {
             />
           </div>
           <div style={{ textAlign: "center", marginTop: 8, fontSize: "12px", color: "#9ca3af" }}>
-            🟡 = radar centre (fixed) &nbsp;•&nbsp; 🐯 = animal live GPS &nbsp;•&nbsp; rings = geofence zones
+            � = your location (centre) &nbsp;•&nbsp; 🐯 = animal GPS &nbsp;•&nbsp; rings = geofence zones
           </div>
         </div>
       </section>
@@ -961,7 +1087,9 @@ function App() {
       <section style={styles.mapSection}>
         <div style={styles.card}>
           <h2 style={styles.cardTitle}>Live Migration Map</h2>
-          <div ref={mapRef} style={{ ...styles.map, height: `${mapHeight}px` }}></div>
+          <div ref={mapWrapperRef} style={styles.mapWrapper}>
+            <div ref={mapRef} style={{ width: "100%", height: `${mapHeight}px` }}></div>
+          </div>
           {mapError ? <div style={styles.mapError}>{mapError}</div> : null}
         </div>
       </section>
@@ -1025,18 +1153,41 @@ function App() {
       <section style={styles.bottomGrid} className="bottomGrid">
         <div style={styles.card}>
           <h2 style={styles.cardTitle}>Frequently Visited Zones</h2>
-          {topVisitedZones.length === 0 ? (
+          {topVisitedZones.length === 0 && currentZoneSummary.length === 0 ? (
             <div style={styles.emptyBox}>No zone visits recorded yet</div>
           ) : (
-            topVisitedZones.map((z) => (
-              <div key={z.id} style={styles.zoneRow}>
-                <div>
-                  <div style={styles.zoneName}>{z.name}</div>
-                  <div style={styles.zoneType}>{z.type}</div>
+            <>
+              {/* Live: zones animal is currently inside */}
+              {currentZoneSummary.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 12, color: "#16a34a", fontWeight: 700, marginBottom: 6 }}>🟢 Currently Inside</div>
+                  {currentZoneSummary.map((z) => (
+                    <div key={z.id} style={{ ...styles.zoneRow, borderColor: z.color, borderWidth: 2 }}>
+                      <div>
+                        <div style={styles.zoneName}>{z.name}</div>
+                        <div style={styles.zoneType}>{z.type}</div>
+                      </div>
+                      <div style={{ ...styles.zoneDistance, color: z.color }}>{z.distance} m</div>
+                    </div>
+                  ))}
                 </div>
-                <div style={styles.zoneCount}>{z.count || 0} visits</div>
-              </div>
-            ))
+              )}
+              {/* Historical visit counts from Firebase */}
+              {topVisitedZones.length > 0 && (
+                <div>
+                  <div style={{ fontSize: 12, color: "#64748b", fontWeight: 700, marginBottom: 6 }}>📊 All-time Visits</div>
+                  {topVisitedZones.map((z) => (
+                    <div key={z.id} style={styles.zoneRow}>
+                      <div>
+                        <div style={styles.zoneName}>{z.name}</div>
+                        <div style={styles.zoneType}>{z.type}</div>
+                      </div>
+                      <div style={styles.zoneCount}>{z.count || 0} visits</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -1065,16 +1216,17 @@ const styles = {
   header: {
     display: "flex",
     justifyContent: "space-between",
-    gap: "16px",
+    gap: "12px",
     alignItems: "flex-start",
     flexWrap: "wrap",
     marginBottom: "18px",
   },
   title: {
     margin: 0,
-    fontSize: "28px",
-    lineHeight: 1.2,
+    fontSize: "clamp(16px, 4vw, 28px)",
+    lineHeight: 1.3,
     color: "#0b3d91",
+    wordBreak: "break-word",
   },
   subtitle: {
     margin: "8px 0 0",
@@ -1084,13 +1236,16 @@ const styles = {
   statusBox: {
     background: "#fff",
     borderRadius: "12px",
-    padding: "12px 16px",
+    padding: "10px 14px",
     boxShadow: "0 4px 18px rgba(15,23,42,0.08)",
     display: "flex",
     alignItems: "center",
-    gap: "10px",
-    minWidth: "220px",
+    gap: "8px",
     fontWeight: 600,
+    fontSize: "13px",
+    flexShrink: 0,
+    maxWidth: "100%",
+    wordBreak: "break-word",
   },
   statusDot: {
     width: "10px",
@@ -1101,15 +1256,15 @@ const styles = {
   },
   heroGrid: {
     display: "grid",
-    gridTemplateColumns: "1fr 1fr",
-    gap: "18px",
+    gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+    gap: "16px",
     marginBottom: "18px",
   },
   bottomGrid: {
     display: "grid",
-    gridTemplateColumns: "1.2fr 0.8fr",
-    gap: "18px",
-    marginTop: "18px",
+    gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))",
+    gap: "16px",
+    marginTop: "16px",
   },
   mapSection: {
     marginBottom: "18px",
@@ -1147,12 +1302,34 @@ const styles = {
     color: "#0f172a",
     wordBreak: "break-word",
   },
+  mapWrapper: {
+    width: "100%",
+    borderRadius: "12px",
+    border: "1px solid #e2e8f0",
+    background: "#e8ecf0",
+    overflow: "visible",
+  },
   map: {
     width: "100%",
     display: "block",
-    position: "relative",
-    border: "1px solid #e2e8f0",
-    borderRadius: "14px",
+  },
+  distanceBox: {
+    background: "linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%)",
+    border: "1.5px solid #93c5fd",
+    borderRadius: "12px",
+    padding: "12px 14px",
+    marginTop: "14px",
+  },
+  distanceLabel: {
+    fontSize: "12px",
+    color: "#1e40af",
+    fontWeight: 600,
+    marginBottom: "4px",
+  },
+  distanceValue: {
+    fontSize: "22px",
+    fontWeight: 800,
+    color: "#1d4ed8",
   },
   mapError: {
     marginTop: "10px",
@@ -1330,103 +1507,66 @@ const styles = {
 };
 
 const responsiveCss = `
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body { overflow-x: hidden; }
+
+  /* ── Tablet ─────────────────────────────────────── */
   @media (max-width: 1024px) {
     .heroGrid, .bottomGrid {
       grid-template-columns: 1fr !important;
     }
-
     .statsGrid {
-      grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+      grid-template-columns: repeat(2, 1fr) !important;
     }
   }
 
+  /* ── Mobile ─────────────────────────────────────── */
   @media (max-width: 768px) {
-    .appRoot {
-      padding: 12px !important;
-      overflow-x: hidden;
-    }
-
-    .radarWrap {
-      padding: 2px !important;
-    }
-
-    .statsGrid {
-      grid-template-columns: 1fr !important;
-    }
-
-    .heroGrid,
-    .bottomGrid {
-      gap: 12px !important;
-    }
-
-    .heroGrid > div,
-    .bottomGrid > div,
-    section > div {
-      padding: 12px !important;
-    }
-
-    .heroGrid h2,
-    .bottomGrid h2,
-    section h2 {
-      font-size: 18px !important;
-    }
-
-    .heroGrid h1 {
-      font-size: 22px !important;
-    }
-
-    .heroGrid p,
-    .bottomGrid p,
-    section p {
-      line-height: 1.45;
-    }
-
-    table {
-      min-width: 620px;
-    }
-  }
-
-  @media (max-width: 420px) {
     .appRoot {
       padding: 10px !important;
     }
-
-    table {
-      min-width: 560px;
+    .appRoot > header {
+      flex-direction: column !important;
+      align-items: stretch !important;
     }
-
-    .heroGrid h1 {
-      font-size: 20px !important;
-      line-height: 1.25;
+    .heroGrid, .bottomGrid {
+      grid-template-columns: 1fr !important;
+      gap: 10px !important;
     }
-
-    .heroGrid > div,
-    .bottomGrid > div,
-    section > div {
+    .heroGrid > div, .bottomGrid > div, .mapSection > div {
+      padding: 12px !important;
       border-radius: 12px !important;
     }
-
-    .heroGrid button,
-    .bottomGrid button,
-    section button {
-      min-height: 36px;
+    .radarWrap {
+      padding: 2px !important;
     }
+    .statsGrid {
+      grid-template-columns: repeat(2, 1fr) !important;
+    }
+  }
 
+  /* ── Small mobile ────────────────────────────────── */
+  @media (max-width: 480px) {
+    .statsGrid {
+      grid-template-columns: 1fr 1fr !important;
+    }
     .popupWrap {
       right: 8px !important;
       left: 8px !important;
       top: 10px !important;
     }
-
     .popupCard {
-      width: auto !important;
+      width: 100% !important;
     }
   }
 
-  @media (max-width: 360px) {
-    table {
-      min-width: 520px;
-    }
+  .tableWrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  table {
+    min-width: 520px;
   }
 `;
 
